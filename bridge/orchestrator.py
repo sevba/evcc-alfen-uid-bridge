@@ -164,11 +164,14 @@ class Orchestrator:
             self._current_vehicle = None
 
     def _handle_evcc_online(self):
-        # EVCC publishes connected=false before going offline, so _car_connected is
-        # already False by now. Set a flag so the imminent connected=true event uses
-        # the extended lookback instead of the 300s window.
+        # On a clean shutdown EVCC publishes connected=false first, so _current_vehicle
+        # is already None. On a hard crash it doesn't, leaving a stale value that would
+        # trip the idempotency check in _apply_vehicle_for_uid and skip the EVCC call
+        # after restart. Clear it here unconditionally so the next connect event always
+        # re-applies the vehicle.
         log.info("orchestrator: EVCC came online — next connect event will use extended lookback")
         self._evcc_just_restarted = True
+        self._current_vehicle = None
 
     def _handle_startup_check(self):
         """
