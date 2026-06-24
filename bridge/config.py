@@ -76,6 +76,9 @@ class Config:
         c.log_level = _env("LOG_LEVEL", "INFO").upper()
         c.log_uid_plaintext = _bool(_env("LOG_UID_PLAINTEXT", "false"))
 
+        c.backoffice_check_enabled = _bool(_env("BACKOFFICE_CHECK_ENABLED", "true"))
+        c.notify_url = _env("NOTIFY_URL", "http://127.0.0.1:2586/evcc")
+
         return c
 
     def log_startup(self):
@@ -99,6 +102,8 @@ class Config:
             f"  uid_vehicle_map     = {list(self.uid_vehicle_map.values())} ({len(self.uid_vehicle_map)} entries)",
             f"  dry_run             = {self.dry_run}",
             f"  log_level           = {self.log_level}",
+            f"  backoffice_check    = {self.backoffice_check_enabled}",
+            f"  notify_url          = {self.notify_url}",
         ]
         for line in lines:
             log.info(line)

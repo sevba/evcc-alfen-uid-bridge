@@ -20,6 +20,8 @@ import time
 from datetime import datetime, timezone
 from typing import Optional
 
+import requests
+
 from .alfen_client import AlfenClient, RateLimiter, uid_hash
 from .config import Config, normalise_uid
 from .evcc_client import EvccClient
@@ -83,6 +85,19 @@ class Orchestrator:
 
         vehicle = self._cfg.uid_vehicle_map.get(normalised)
         if not vehicle:
+            # State-line UIDs may be truncated by firmware (e.g. "5B9F" instead of
+            # "5B9F4379"). Try prefix match: find map keys that start with the found UID.
+            prefix_matches = {k: v for k, v in self._cfg.uid_vehicle_map.items()
+                              if k.startswith(normalised)}
+            if len(prefix_matches) == 1:
+                vehicle = next(iter(prefix_matches.values()))
+                log.info("orchestrator: UID %s matched by prefix to %s",
+                         uid_label, next(iter(prefix_matches)))
+            elif len(prefix_matches) > 1:
+                log.warning("orchestrator: UID %s is an ambiguous prefix (%d matches), skipping",
+                            uid_label, len(prefix_matches))
+
+        if not vehicle:
             log.warning("orchestrator: UID %s not in map", uid_label)
             self._apply_unknown_tag()
             return
@@ -103,6 +118,7 @@ class Orchestrator:
                 log.warning("orchestrator: could not login to Alfen")
                 return None
             try:
+                self._check_and_notify_backoffice(alfen)
                 return alfen.get_latest_tag(since=since, lookback_s=lookback_s, max_pages=100)
             finally:
                 alfen.logout()
@@ -132,6 +148,8 @@ class Orchestrator:
                 return
 
             try:
+                self._check_and_notify_backoffice(alfen)
+
                 deadline = time.monotonic() + self._cfg.tag_wait_timeout
                 poll = self._cfg.tag_poll_interval
 
@@ -196,6 +214,54 @@ class Orchestrator:
             self._apply_unknown_tag()
             return
         self._apply_vehicle_for_uid(uid)
+
+    def _check_and_notify_backoffice(self, alfen: AlfenClient):
+        """Advisory back-office connectivity check on an already-authenticated session.
+
+        Reads BOConnection from /api/info; fires a notification if not "online".
+        Any error is caught, logged, and ignored — this must never affect RFID/vehicle flow.
+        """
+        if not self._cfg.backoffice_check_enabled:
+            return
+        try:
+            bo_status = alfen.get_bo_connection()
+            if bo_status is None:
+                log.debug("orchestrator: BOConnection not available — skipping check")
+                return
+            log.debug("orchestrator: BOConnection = %r", bo_status)
+            if bo_status != "online":
+                log.warning("orchestrator: Alfen back office is OFFLINE (BOConnection=%r)", bo_status)
+                self._notify_backoffice_offline()
+        except Exception as exc:
+            log.warning("orchestrator: back-office check failed (ignored): %s", exc)
+
+    def _notify_backoffice_offline(self):
+        """Fire-and-forget HTTP POST to NOTIFY_URL with a plain-text offline alert."""
+        now_str = datetime.now().strftime("%H:%M:%S %d/%m/%Y")
+        msg = (
+            f"Alfen back office OFFLINE - charger not connected to OCPP back office "
+            f"(seen at session start {now_str})."
+        )
+        url = self._cfg.notify_url
+
+        def _post():
+            try:
+                resp = requests.post(
+                    url,
+                    data=msg.encode("utf-8"),
+                    headers={
+                        "Content-Type": "text/plain; charset=utf-8",
+                        "X-Title": "EV charger",
+                        "X-Priority": "3",
+                        "X-Tags": "electric_plug",
+                    },
+                    timeout=5,
+                )
+                log.info("orchestrator: back-office offline notification sent (HTTP %s)", resp.status_code)
+            except Exception as exc:
+                log.warning("orchestrator: notification send failed (ignored): %s", exc)
+
+        threading.Thread(target=_post, daemon=True, name="backoffice-notify").start()
 
     def _apply_unknown_tag(self):
         if self._cfg.on_unknown_tag == "default" and self._cfg.default_vehicle:

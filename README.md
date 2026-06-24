@@ -251,6 +251,14 @@ All settings are via environment variables. The recommended approach is to keep 
 
 UIDs are normalised before matching: non-alphanumeric characters are stripped and the string is uppercased. This means `04:A1:B2:C3` and `04a1b2c3` both match `04A1B2C3` in the map.
 
+### Truncated UIDs (state-line fallback)
+
+The Alfen firmware logs RFID UIDs through three different log patterns. The two preferred patterns (`Reader 0 Got NFC tag` and `Tag X is authorised by server`) always carry the full UID. The fallback pattern — a socket state line such as `Socket #1: main state: …, tag: 5B9F` — can render a truncated UID (typically the first 2 bytes).
+
+If the preferred patterns are not present in the 300-second lookback window, the bridge falls back to the state-line UID. To handle this gracefully, the bridge performs a **prefix match** when no exact map entry is found: if exactly one key in `UID_VEHICLE_MAP` starts with the found UID, that entry is used and a log line notes the match. If the prefix is ambiguous (matches more than one key), the bridge falls through to unknown-tag behaviour.
+
+This means `UID_VEHICLE_MAP` only ever needs full UIDs — there is no need to add shortened variants as extra entries.
+
 ### BMW CarData vehicles
 
 When configuring BMW vehicles in EVCC, the `clientid` is a **registered OAuth application ID**, not a per-account or per-vehicle identifier. It is the same for all vehicles in the same BMW ConnectedDrive account. If two vehicles belong to different BMW accounts, use the same community `clientid` for both — the VIN determines which car's data is returned. Each account must be separately authorised through the EVCC UI.
@@ -265,8 +273,10 @@ Another client is holding the management session. MyEve, ACE Service Installer, 
 **"no RFID tag found within Xs window"**
 The bridge polled the Alfen log but found no matching UID. Run with `LOG_LEVEL=DEBUG LOG_UID_PLAINTEXT=true` to see raw candidates. Possible causes:
 - The card tap did not produce an NFC reader line in the log (uncommon).
-- The charger was in offline/auth mode and only logged a truncated UID — check for a `Tag X is authorised` line from a recent session.
 - The connect event fired more than 300 seconds after the tap (e.g. the car was plugged in without a card, then a card was tapped later).
+
+**Vehicle set to "unknown" / UID not matched despite card being in the map**
+The bridge may have found only a truncated UID from the fallback state-line pattern (e.g. `5B9F` instead of `5B9F4379`). The bridge handles this with a prefix match, so it should resolve correctly as long as the map contains the full UID and no other entry shares the same prefix. Enable `LOG_LEVEL=DEBUG LOG_UID_PLAINTEXT=true` and look for `matched by prefix` in the log to confirm. If two cards share the same first 2 bytes the prefix is ambiguous and both must be present as full UIDs for the match to succeed.
 
 **Vehicle set to wrong car**
 Check `UID_VEHICLE_MAP` in `.env` — UIDs are normalised (uppercase, no separators). Run with `LOG_UID_PLAINTEXT=true` to confirm which UID is being detected. The two patterns (NFC reader vs. OCPP auth line) can produce different representations of the same card; the bridge prefers the NFC reader line.

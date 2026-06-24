@@ -287,6 +287,50 @@ class AlfenClient:
 
         return best_uid
 
+    def get_bo_connection(self) -> Optional[str]:
+        """Return the BOConnection value from /api/info, or None on error.
+
+        Returns "online" when connected to the back office (OCPP CSMS),
+        a different string (e.g. "offline") when not connected.
+        """
+        try:
+            resp = self._session.get(self._url("/api/info"), timeout=5)
+            if resp.status_code == 401:
+                log.warning("alfen: get_bo_connection 401")
+                return None
+            resp.raise_for_status()
+            data = resp.json()
+            return data.get("BOConnection")
+        except Exception as exc:
+            log.error("alfen: get_bo_connection error: %s", exc)
+            return None
+
+    def get_property(self, prop_id: str) -> Optional[object]:
+        """Fetch a single Alfen property value from /api/prop.
+
+        Returns the first value element, or None on any error or missing data.
+        Response format: [{"id": "...", "value": [<val>], ...}]
+        """
+        try:
+            resp = self._session.get(
+                self._url("/api/prop"),
+                params={"ids[]": prop_id},
+                timeout=5,
+            )
+            if resp.status_code == 401:
+                log.warning("alfen: get_property 401 for %s", prop_id)
+                return None
+            resp.raise_for_status()
+            data = resp.json()
+            if isinstance(data, list) and data:
+                values = data[0].get("value", [])
+                if values:
+                    return values[0]
+            return None
+        except Exception as exc:
+            log.error("alfen: get_property(%s) error: %s", prop_id, exc)
+            return None
+
     def __enter__(self):
         return self
 
