@@ -158,3 +158,152 @@ def test_dry_run_does_not_call_evcc():
             orch._handle_connect(datetime.now(tz=timezone.utc))
             mock_post.assert_not_called()
             mock_del.assert_not_called()
+
+
+# ---- EVCC restart recovery ---------------------------------------------------
+
+def _make_orch(cfg, alfen_uid=None, evcc_vehicle=""):
+    """
+    Build an Orchestrator with a stubbed Alfen factory, EVCC client, and MQTT
+    listener.  The AlfenClient patch is intentionally NOT kept alive for the
+    duration of the test — instead we replace orch._make_alfen() with a lambda
+    that always returns the same mock.  This avoids leaking real HTTPS calls when
+    the patch context manager exits before test methods run.
+    """
+    mock_alfen = MagicMock()
+    mock_alfen.login.return_value = True
+    mock_alfen.get_latest_tag.return_value = alfen_uid
+
+    mock_evcc = MagicMock()
+    mock_evcc.set_vehicle.return_value = True
+    mock_evcc.clear_vehicle.return_value = True
+    mock_evcc.get_vehicle.return_value = evcc_vehicle
+
+    with patch("bridge.orchestrator.EvccClient", return_value=mock_evcc), \
+         patch("bridge.orchestrator.MqttListener"):
+        orch = Orchestrator(cfg)
+
+    # Replace the factory so every _make_alfen() call returns our mock instance.
+    orch._make_alfen = lambda: mock_alfen
+    orch._evcc = mock_evcc
+    orch._mock_alfen = mock_alfen
+    return orch
+
+
+def test_evcc_online_sets_flag_and_clears_vehicle():
+    cfg = _make_config()
+    orch = _make_orch(cfg)
+    orch._current_vehicle = "bmw320e"
+
+    orch._handle_evcc_online()
+
+    assert orch._evcc_just_restarted is True
+    assert orch._current_vehicle is None
+
+
+def test_evcc_restart_connect_uses_extended_lookback():
+    """After EVCC restart, _handle_connect must scan with max_pages=100."""
+    cfg = _make_config()
+    orch = _make_orch(cfg, alfen_uid="04A1B2C3")
+    orch._evcc_just_restarted = True
+
+    orch._handle_connect(datetime.now(tz=timezone.utc))
+
+    _, kwargs = orch._mock_alfen.get_latest_tag.call_args
+    assert kwargs.get("max_pages") == 100
+    orch._evcc.set_vehicle.assert_called_once_with("bmw320e")
+
+
+def test_evcc_restart_connect_clears_flag():
+    """The _evcc_just_restarted flag must be consumed by the first connect."""
+    cfg = _make_config()
+    orch = _make_orch(cfg, alfen_uid="04A1B2C3")
+    orch._evcc_just_restarted = True
+
+    orch._handle_connect(datetime.now(tz=timezone.utc))
+
+    assert orch._evcc_just_restarted is False
+
+
+def test_normal_connect_does_not_use_max_pages_100():
+    """A normal connect (no restart) must use the default max_pages, not 100."""
+    cfg = _make_config()
+    orch = _make_orch(cfg, alfen_uid="04A1B2C3")
+    # _evcc_just_restarted is False by default
+
+    orch._handle_connect(datetime.now(tz=timezone.utc))
+
+    call_kwargs = orch._mock_alfen.get_latest_tag.call_args
+    # max_pages should not be explicitly set (uses the alfen_client default of 20)
+    assert call_kwargs.kwargs.get("max_pages", 20) == 20
+
+
+# ---- Startup check -----------------------------------------------------------
+
+def test_startup_check_known_vehicle_no_alfen_call():
+    """If EVCC already has a known vehicle, startup check must not touch Alfen."""
+    cfg = _make_config()
+    orch = _make_orch(cfg, evcc_vehicle="bmw320e")
+
+    orch._handle_startup_check()
+
+    orch._mock_alfen.login.assert_not_called()
+    orch._evcc.set_vehicle.assert_not_called()
+    assert orch._current_vehicle == "bmw320e"
+
+
+def test_startup_check_unset_vehicle_scans_log():
+    """If EVCC has no vehicle, startup check must scan Alfen and set vehicle."""
+    cfg = _make_config()
+    orch = _make_orch(cfg, alfen_uid="04A1B2C3", evcc_vehicle="")
+
+    orch._handle_startup_check()
+
+    orch._evcc.set_vehicle.assert_called_once_with("bmw320e")
+    _, kwargs = orch._mock_alfen.get_latest_tag.call_args
+    assert kwargs.get("max_pages") == 100
+
+
+def test_startup_check_unknown_vehicle_name_triggers_scan():
+    """'unknown' in EVCC (not in uid_map values) must trigger re-identification."""
+    cfg = _make_config()
+    orch = _make_orch(cfg, alfen_uid="04A1B2C3", evcc_vehicle="unknown")
+
+    orch._handle_startup_check()
+
+    orch._evcc.set_vehicle.assert_called_once_with("bmw320e")
+
+
+def test_startup_check_log_empty_sets_default_vehicle():
+    """If log scan finds no tag and ON_UNKNOWN_TAG=default, must set default vehicle."""
+    cfg = _make_config(on_unknown_tag="default", default_vehicle="fallback")
+    orch = _make_orch(cfg, alfen_uid=None, evcc_vehicle="")
+
+    orch._handle_startup_check()
+
+    orch._evcc.set_vehicle.assert_called_once_with("fallback")
+
+
+def test_startup_check_log_empty_auto_mode_no_action():
+    """If log scan finds no tag and ON_UNKNOWN_TAG=auto, must leave EVCC alone."""
+    cfg = _make_config(on_unknown_tag="auto")
+    orch = _make_orch(cfg, alfen_uid=None, evcc_vehicle="")
+
+    orch._handle_startup_check()
+
+    orch._evcc.set_vehicle.assert_not_called()
+
+
+def test_hard_crash_recovery_sets_vehicle():
+    """
+    Simulate EVCC hard crash: no connected=false published, so _current_vehicle
+    is stale. After evcc_online + connect, vehicle must still be (re-)applied.
+    """
+    cfg = _make_config()
+    orch = _make_orch(cfg, alfen_uid="04A1B2C3")
+    orch._current_vehicle = "bmw320e"  # stale — EVCC restarted without clearing
+
+    orch._handle_evcc_online()          # clears _current_vehicle, sets flag
+    orch._handle_connect(datetime.now(tz=timezone.utc))
+
+    orch._evcc.set_vehicle.assert_called_once_with("bmw320e")
