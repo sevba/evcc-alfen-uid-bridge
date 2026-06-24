@@ -86,8 +86,8 @@ The local API side-channel approach is non-intrusive and requires no changes to 
 │  │  4. EVCC REST: POST /api/loadpoints/1/vehicle  │     │
 │  │                                                │     │
 │  │  Also: on evcc/status=online (EVCC restart)    │     │
-│  │  → re-apply last known vehicle without         │     │
-│  │    re-querying the Alfen                       │     │
+│  │  → set flag; on next connected=true,           │     │
+│  │    re-identify via Alfen (72h lookback)        │     │
 │  └────────────────────────────────────────────────┘     │
 │                                                         │
 │  ┌───────────┐                                          │
@@ -113,7 +113,10 @@ The local API side-channel approach is non-intrusive and requires no changes to 
 
 **EVCC restart while car is connected:**
 1. EVCC publishes `evcc/status = online`.
-2. Bridge detects this and re-applies the last known vehicle directly to EVCC — no Alfen login needed.
+2. Bridge sets an internal flag and clears its cached vehicle state.
+3. EVCC republishes `connected = true`.
+4. Bridge logs in to Alfen and scans the log with a 72-hour lookback to re-identify the vehicle.
+5. Bridge calls `POST /api/loadpoints/1/vehicle/{name}` on EVCC.
 
 ### Single-session constraint
 
@@ -269,7 +272,7 @@ The bridge polled the Alfen log but found no matching UID. Run with `LOG_LEVEL=D
 Check `UID_VEHICLE_MAP` in `.env` — UIDs are normalised (uppercase, no separators). Run with `LOG_UID_PLAINTEXT=true` to confirm which UID is being detected. The two patterns (NFC reader vs. OCPP auth line) can produce different representations of the same card; the bridge prefers the NFC reader line.
 
 **EVCC restarts and vehicle selection is lost**
-The bridge subscribes to `evcc/status` and re-applies the last known vehicle automatically when EVCC comes back online, as long as the car is still connected. No manual intervention needed.
+The bridge subscribes to `evcc/status`. When EVCC comes back online and the car is still connected, the bridge performs a fresh 72-hour Alfen log scan to re-identify the vehicle and re-assigns it in EVCC. This also covers hard crashes where EVCC didn't publish `connected=false` before going down. No manual intervention needed.
 
 **EVCC still shows "requesting authorization" for a BMW vehicle**
 The OAuth callback URL (`http://<evcc-host>:<port>/...`) must be reachable from the browser you use to authorise. If you authorise from a remote device via VPN or Tailscale, the BMW redirect may land on the wrong host. Use a browser on the local network that can reach EVCC directly.
