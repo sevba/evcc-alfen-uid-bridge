@@ -1,0 +1,178 @@
+"""
+Orchestrator: ties together MQTT events, Alfen tag acquisition, and EVCC actions.
+
+On CONNECTED:
+  1. Record connect timestamp.
+  2. Poll Alfen log for a tag newer than that timestamp for up to TAG_WAIT_TIMEOUT_S.
+  3. Map the UID to an EVCC vehicle name.
+  4. Set the vehicle in EVCC (unless already selected or dry-run).
+
+On DISCONNECTED:
+  1. Optionally release the vehicle selection in EVCC.
+
+Alfen access is serialised via a lock (single-session requirement).
+"""
+
+import logging
+import queue
+import threading
+import time
+from datetime import datetime, timezone
+from typing import Optional
+
+from .alfen_client import AlfenClient, RateLimiter, uid_hash
+from .config import Config, normalise_uid
+from .evcc_client import EvccClient
+from .mqtt_listener import CONNECTED, DISCONNECTED, MqttListener
+
+log = logging.getLogger(__name__)
+
+_SENTINEL = object()
+
+
+class Orchestrator:
+    def __init__(self, config: Config):
+        self._cfg = config
+        self._event_queue: queue.Queue = queue.Queue()
+        self._alfen_lock = threading.Lock()
+        self._shutdown = threading.Event()
+        self._current_vehicle: Optional[str] = None
+
+        self._rate_limiter = RateLimiter(config.login_rate_max, config.login_rate_window)
+
+        self._evcc = EvccClient(
+            config.evcc_base_url,
+            config.evcc_loadpoint_id,
+            config.dry_run,
+        )
+
+        self._listener = MqttListener(
+            host=config.mqtt_host,
+            port=config.mqtt_port,
+            username=config.mqtt_username,
+            password=config.mqtt_password,
+            topic_prefix=config.mqtt_topic_prefix,
+            loadpoint_id=config.evcc_loadpoint_id,
+            on_event=self._dispatch,
+        )
+
+    def _dispatch(self, event: str):
+        """Called from the MQTT callback thread — just enqueue."""
+        self._event_queue.put((event, datetime.now(tz=timezone.utc)))
+
+    def _make_alfen(self) -> AlfenClient:
+        cfg = self._cfg
+        return AlfenClient(
+            host=cfg.alfen_host,
+            username=cfg.alfen_username,
+            password=cfg.alfen_password,
+            socket=cfg.alfen_socket,
+            tls_verify=cfg.alfen_tls_verify,
+            rate_limiter=self._rate_limiter,
+            log_uid_plaintext=cfg.log_uid_plaintext,
+        )
+
+    def _handle_connect(self, connect_time: datetime):
+        uid: Optional[str] = None
+
+        with self._alfen_lock:
+            alfen = self._make_alfen()
+            if not alfen.login():
+                log.warning("orchestrator: could not login to Alfen, leaving EVCC on auto-detection")
+                return
+
+            try:
+                deadline = time.monotonic() + self._cfg.tag_wait_timeout
+                poll = self._cfg.tag_poll_interval
+
+                while time.monotonic() < deadline:
+                    uid = alfen.get_latest_tag(since=connect_time)
+                    if uid:
+                        break
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    sleep_s = min(poll, remaining)
+                    log.debug("orchestrator: no tag yet, retrying in %.0fs", sleep_s)
+                    time.sleep(sleep_s)
+            finally:
+                alfen.logout()
+
+        if not uid:
+            log.warning("orchestrator: no RFID tag found within %ds window", self._cfg.tag_wait_timeout)
+            self._apply_unknown_tag()
+            return
+
+        normalised = normalise_uid(uid)
+        uid_label = uid if self._cfg.log_uid_plaintext else uid_hash(normalised)
+        log.info("orchestrator: tag acquired uid_hash=%s", uid_label)
+
+        vehicle = self._cfg.uid_vehicle_map.get(normalised)
+        if not vehicle:
+            log.warning("orchestrator: UID %s not in map — leaving EVCC on auto-detection", uid_label)
+            self._apply_unknown_tag()
+            return
+
+        # Idempotency: skip if already selected
+        if self._current_vehicle == vehicle:
+            log.info("orchestrator: vehicle %s already selected, no action", vehicle)
+            return
+
+        if self._evcc.set_vehicle(vehicle):
+            self._current_vehicle = vehicle
+
+    def _handle_disconnect(self):
+        if not self._cfg.release_on_disconnect:
+            log.debug("orchestrator: release_on_disconnect=false, keeping selection")
+            return
+        if self._evcc.clear_vehicle():
+            self._current_vehicle = None
+
+    def _apply_unknown_tag(self):
+        if self._cfg.on_unknown_tag == "default" and self._cfg.default_vehicle:
+            if self._current_vehicle != self._cfg.default_vehicle:
+                if self._evcc.set_vehicle(self._cfg.default_vehicle):
+                    self._current_vehicle = self._cfg.default_vehicle
+        # else: leave on auto-detection
+
+    def _event_loop(self):
+        log.info("orchestrator: event processor started")
+        while not self._shutdown.is_set():
+            try:
+                item = self._event_queue.get(timeout=1)
+            except queue.Empty:
+                continue
+
+            if item is _SENTINEL:
+                break
+
+            event, ts = item
+            log.debug("orchestrator: processing event=%s ts=%s", event, ts.isoformat())
+
+            if event == CONNECTED:
+                self._handle_connect(ts)
+            elif event == DISCONNECTED:
+                self._handle_disconnect()
+            else:
+                log.warning("orchestrator: unknown event %s", event)
+
+            self._event_queue.task_done()
+
+        log.info("orchestrator: event processor stopped")
+
+    def run(self):
+        processor = threading.Thread(target=self._event_loop, daemon=True, name="event-processor")
+        processor.start()
+
+        self._listener.start()
+        log.info("orchestrator: running — waiting for events")
+
+        self._shutdown.wait()
+
+        self._listener.stop()
+        self._event_queue.put(_SENTINEL)
+        processor.join(timeout=10)
+
+    def shutdown(self):
+        log.info("orchestrator: shutdown requested")
+        self._shutdown.set()

@@ -1,0 +1,40 @@
+services:
+  evcc-alfen-uid-bridge:
+    build: .
+    container_name: evcc-alfen-uid-bridge
+    restart: unless-stopped
+    network_mode: host      # needs: Alfen on 10.0.40.66:443, EVCC on 127.0.0.1:7070, MQTT on 127.0.0.1:1883
+    environment:
+      # Alfen charger
+      ALFEN_HOST: "10.0.40.66"
+      ALFEN_USERNAME: "admin"
+      ALFEN_PASSWORD: "${ALFEN_PASSWORD}"
+      ALFEN_SOCKET: "1"
+      ALFEN_TLS_VERIFY: "false"
+
+      # Tag acquisition
+      TAG_WAIT_TIMEOUT_S: "15"
+      TAG_POLL_INTERVAL_S: "3"
+
+      # EVCC REST
+      EVCC_BASE_URL: "http://127.0.0.1:7070"
+      EVCC_LOADPOINT_ID: "1"
+
+      # Behaviour
+      RELEASE_ON_DISCONNECT: "true"
+      ON_UNKNOWN_TAG: "auto"
+
+      # MQTT
+      MQTT_HOST: "127.0.0.1"
+      MQTT_PORT: "1883"
+      MQTT_USERNAME: "mqtt"
+      MQTT_PASSWORD: "${MQTT_PASSWORD}"
+      MQTT_TOPIC_PREFIX: "evcc"
+
+      # UID → vehicle map  (add cards here; UIDs are normalised before matching)
+      UID_VEHICLE_MAP: '${UID_VEHICLE_MAP}'
+
+      # Logging
+      LOG_LEVEL: "INFO"
+      LOG_UID_PLAINTEXT: "false"
+      DRY_RUN: "false"

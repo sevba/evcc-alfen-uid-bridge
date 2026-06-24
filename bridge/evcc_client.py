@@ -1,0 +1,75 @@
+import logging
+import time
+
+import requests
+
+log = logging.getLogger(__name__)
+
+_RETRY_DELAYS = [1, 3, 5]
+
+
+class EvccClient:
+    def __init__(self, base_url: str, loadpoint_id: int, dry_run: bool = False):
+        self._base = base_url.rstrip("/")
+        self._lp = loadpoint_id
+        self._dry_run = dry_run
+
+    def _post(self, path: str) -> bool:
+        url = f"{self._base}{path}"
+        if self._dry_run:
+            log.info("evcc [dry-run]: POST %s", url)
+            return True
+        for delay in [0] + _RETRY_DELAYS:
+            if delay:
+                time.sleep(delay)
+            try:
+                resp = requests.post(url, timeout=10)
+                resp.raise_for_status()
+                log.debug("evcc: POST %s → %d", url, resp.status_code)
+                return True
+            except Exception as exc:
+                log.warning("evcc: POST %s failed: %s (retrying)", url, exc)
+        log.error("evcc: giving up on POST %s", url)
+        return False
+
+    def _delete(self, path: str) -> bool:
+        url = f"{self._base}{path}"
+        if self._dry_run:
+            log.info("evcc [dry-run]: DELETE %s", url)
+            return True
+        for delay in [0] + _RETRY_DELAYS:
+            if delay:
+                time.sleep(delay)
+            try:
+                resp = requests.delete(url, timeout=10)
+                resp.raise_for_status()
+                log.debug("evcc: DELETE %s → %d", url, resp.status_code)
+                return True
+            except Exception as exc:
+                log.warning("evcc: DELETE %s failed: %s (retrying)", url, exc)
+        log.error("evcc: giving up on DELETE %s", url)
+        return False
+
+    def set_vehicle(self, vehicle_name: str) -> bool:
+        path = f"/api/loadpoints/{self._lp}/vehicle/{vehicle_name}"
+        ok = self._post(path)
+        if ok:
+            log.info("evcc: set loadpoint %d vehicle → %s", self._lp, vehicle_name)
+        return ok
+
+    def clear_vehicle(self) -> bool:
+        path = f"/api/loadpoints/{self._lp}/vehicle"
+        ok = self._delete(path)
+        if ok:
+            log.info("evcc: cleared loadpoint %d vehicle (back to auto-detection)", self._lp)
+        return ok
+
+    def get_vehicle(self) -> str:
+        """Return the currently selected vehicle name, or '' if none/error."""
+        url = f"{self._base}/api/loadpoints/{self._lp}/vehicle"
+        try:
+            resp = requests.get(url, timeout=5)
+            resp.raise_for_status()
+            return resp.json().get("result", "")
+        except Exception:
+            return ""
