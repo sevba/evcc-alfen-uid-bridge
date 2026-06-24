@@ -73,10 +73,9 @@ def _extract_tag_entry(message: str, socket: int, full_uid_only: bool = False) -
     3. State line — has socket, but UID may be TRUNCATED by firmware (taskMain.c):
          Socket #1: main state: ..., tag: 1234
 
-    Patterns 1 and 2 are accepted for any socket. Pattern 3 is a fallback for
-    normal (short-window) connects. For extended-lookback scans (full_uid_only=True)
-    pattern 3 is skipped — state lines from earlier sessions would produce stale or
-    truncated UIDs that override the correct NFC reader entry.
+    Patterns 1 and 2 are accepted for any socket. Pattern 3 is the fallback.
+    Truncated UIDs from pattern 3 are resolved upstream via prefix matching in
+    the orchestrator, so full_uid_only is no longer set automatically.
     """
     # Pattern 1: NFC reader — full UID, always accept
     m = _RE_NFC_READER.search(message)
@@ -95,7 +94,7 @@ def _extract_tag_entry(message: str, socket: int, full_uid_only: bool = False) -
             m_tag = _RE_STATE_TAG.search(message)
             if m_tag:
                 uid = m_tag.group(1)
-                log.debug("alfen: tag from state-line (may be truncated): %s", uid)
+                log.debug("alfen: tag from state-line (prefix match will resolve if truncated): %s", uid)
                 return uid
 
     return None
@@ -270,8 +269,7 @@ class AlfenClient:
                     hit_before_window = True
                     break  # entries are too old — stop paginating
 
-                uid = _extract_tag_entry(message, self._socket,
-                                         full_uid_only=(lookback_s > _LOOKBACK_S))
+                uid = _extract_tag_entry(message, self._socket, full_uid_only=False)
                 if uid and lid > best_lid:
                     best_lid = lid
                     best_uid = uid
