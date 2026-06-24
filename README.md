@@ -160,19 +160,19 @@ LOG_LEVEL=DEBUG LOG_UID_PLAINTEXT=true DRY_RUN=true docker compose up
 Tap your RFID card at the charger and watch the output. You will see lines like:
 
 ```
-orchestrator: tag acquired uid_hash=... (plaintext: 041CF6BAC01690)
+orchestrator: tag acquired uid_hash=... (plaintext: 04AABBCCDDEEFF)
 ```
 
 Full UIDs come from two log patterns:
 - `Reader 0 Got NFC tag: {UID}` — fires on every tap (preferred source).
 - `Tag {UID} is authorised by server` — fires when the charger updates its whitelist.
 
-> If only a short/truncated UID appears (e.g. `5B9F` instead of `5B9F4379`), look for a `Tag X is authorised` line from a previous session, or check the OCPP transaction log in the charger's web UI at `https://<alfen-ip>`.
+> If only a short/truncated UID appears (e.g. `1234` instead of `12345678`), look for a `Tag X is authorised` line from a previous session, or check the OCPP transaction log in the charger's web UI at `https://<alfen-ip>`.
 
 ### 4. Update `.env` with the UID map
 
 ```
-UID_VEHICLE_MAP={"041CF6BAC01690": "bmwx130e", "5B9F4379": "bmw320e"}
+UID_VEHICLE_MAP={"04AABBCCDDEEFF": "bmwx130e", "12345678": "bmw320e"}
 ```
 
 Vehicle names must match the `name:` field of the vehicle entries in your `evcc.yaml`.

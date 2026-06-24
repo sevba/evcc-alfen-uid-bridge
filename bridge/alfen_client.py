@@ -67,11 +67,11 @@ def _extract_tag_entry(message: str, socket: int, full_uid_only: bool = False) -
 
     Three patterns, in preference order:
     1. NFC reader line — full UID, no socket prefix (tag.c):
-         Reader 0 Got NFC tag: 041CF6BAC01690
+         Reader 0 Got NFC tag: 04AABBCCDDEEFF
     2. Auth/whitelist line — full UID, no socket prefix (tag.c):
-         Tag 041CF6BAC01690 is authorised by server, white list updated
+         Tag 04AABBCCDDEEFF is authorised by server, white list updated
     3. State line — has socket, but UID may be TRUNCATED by firmware (taskMain.c):
-         Socket #1: main state: ..., tag: 5B9F
+         Socket #1: main state: ..., tag: 1234
 
     Patterns 1 and 2 are accepted for any socket. Pattern 3 is a fallback for
     normal (short-window) connects. For extended-lookback scans (full_uid_only=True)

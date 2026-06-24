@@ -121,24 +121,24 @@ def test_malformed_json_trailing_comma():
 # ---- NFC reader and auth patterns -------------------------------------------
 
 def test_extract_nfc_reader_pattern():
-    uid = _extract_tag_entry("Reader 0 Got NFC tag: 041CF6BAC01690", socket=1)
-    assert uid == "041CF6BAC01690"
+    uid = _extract_tag_entry("Reader 0 Got NFC tag: 04AABBCCDDEEFF", socket=1)
+    assert uid == "04AABBCCDDEEFF"
 
 
 def test_extract_nfc_reader_not_socket_specific():
     """NFC reader lines have no socket prefix — must match any socket."""
-    uid = _extract_tag_entry("Reader 0 Got NFC tag: 041CF6BAC01690", socket=2)
-    assert uid == "041CF6BAC01690"
+    uid = _extract_tag_entry("Reader 0 Got NFC tag: 04AABBCCDDEEFF", socket=2)
+    assert uid == "04AABBCCDDEEFF"
 
 
 def test_extract_auth_line_pattern():
-    uid = _extract_tag_entry("Tag 5B9F4379 is authorised by server, white list updated", socket=1)
-    assert uid == "5B9F4379"
+    uid = _extract_tag_entry("Tag 12345678 is authorised by server, white list updated", socket=1)
+    assert uid == "12345678"
 
 
 def test_extract_auth_line_not_socket_specific():
-    uid = _extract_tag_entry("Tag 5B9F4379 is authorised by server", socket=2)
-    assert uid == "5B9F4379"
+    uid = _extract_tag_entry("Tag 12345678 is authorised by server", socket=2)
+    assert uid == "12345678"
 
 
 # ---- full_uid_only flag (extended lookback) ----------------------------------
@@ -149,20 +149,20 @@ def test_full_uid_only_skips_state_line():
 
 
 def test_full_uid_only_keeps_nfc_reader():
-    uid = _extract_tag_entry("Reader 0 Got NFC tag: 041CF6BAC01690", socket=1, full_uid_only=True)
-    assert uid == "041CF6BAC01690"
+    uid = _extract_tag_entry("Reader 0 Got NFC tag: 04AABBCCDDEEFF", socket=1, full_uid_only=True)
+    assert uid == "04AABBCCDDEEFF"
 
 
 def test_full_uid_only_keeps_auth_line():
-    uid = _extract_tag_entry("Tag 5B9F4379 is authorised by server", socket=1, full_uid_only=True)
-    assert uid == "5B9F4379"
+    uid = _extract_tag_entry("Tag 12345678 is authorised by server", socket=1, full_uid_only=True)
+    assert uid == "12345678"
 
 
 # ---- Actual Alfen log format (verified from live device) --------------------
 
-ALFEN_NFC_LINE = "843136_2026-06-24T11:34:59.535Z:INFO:tag.c:123:Reader 0 Got NFC tag: 041CF6BAC01690"
-ALFEN_AUTH_LINE = "843200_2026-06-24T11:35:00.123Z:INFO:tag.c:456:Tag 5B9F4379 is authorised by server, white list updated"
-ALFEN_STATE_LINE = "843256_2026-06-24T11:35:10.000Z:INFO:taskMain.c:5996:Socket #1: main state: charging, tag: 5B9F4379"
+ALFEN_NFC_LINE = "843136_2026-06-24T11:34:59.535Z:INFO:tag.c:123:Reader 0 Got NFC tag: 04AABBCCDDEEFF"
+ALFEN_AUTH_LINE = "843200_2026-06-24T11:35:00.123Z:INFO:tag.c:456:Tag 12345678 is authorised by server, white list updated"
+ALFEN_STATE_LINE = "843256_2026-06-24T11:35:10.000Z:INFO:taskMain.c:5996:Socket #1: main state: charging, tag: 12345678"
 
 
 def test_alfen_nfc_line_parses_and_extracts():
@@ -171,7 +171,7 @@ def test_alfen_nfc_line_parses_and_extracts():
     lid, ts, message = result
     assert lid == 843136
     assert ts.tzinfo is not None
-    assert _extract_tag_entry(message, socket=1) == "041CF6BAC01690"
+    assert _extract_tag_entry(message, socket=1) == "04AABBCCDDEEFF"
 
 
 def test_alfen_auth_line_parses_and_extracts():
@@ -179,7 +179,7 @@ def test_alfen_auth_line_parses_and_extracts():
     assert result is not None
     lid, ts, message = result
     assert lid == 843200
-    assert _extract_tag_entry(message, socket=1) == "5B9F4379"
+    assert _extract_tag_entry(message, socket=1) == "12345678"
 
 
 def test_alfen_state_line_parses_and_extracts():
@@ -187,7 +187,7 @@ def test_alfen_state_line_parses_and_extracts():
     assert result is not None
     lid, ts, message = result
     assert lid == 843256
-    assert _extract_tag_entry(message, socket=1) == "5B9F4379"
+    assert _extract_tag_entry(message, socket=1) == "12345678"
 
 
 def test_alfen_state_line_skipped_with_full_uid_only():
