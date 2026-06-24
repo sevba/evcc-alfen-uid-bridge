@@ -229,8 +229,9 @@ class AlfenClient:
         so we look back `lookback_s` seconds before `since`. Pass a large
         lookback_s (e.g. 259200) on startup to recover sessions from hours ago.
 
-        max_pages caps how many 128-entry pages are fetched. Raise it for
-        extended-lookback scans where the tap may be deep in the log history.
+        max_pages caps how many pages are fetched. The Alfen log API returns
+        16 entries per page; raise it for extended-lookback scans where the tap
+        may be deep in the log history (72 h ≈ 700 pages at typical log rates).
 
         Returns the UID string with the highest log-ID found, or None.
         """
@@ -280,7 +281,7 @@ class AlfenClient:
             if hit_before_window:
                 break
 
-            offset += 128
+            offset += max(len(lines), 1)
             pages_searched += 1
 
         return best_uid

@@ -119,7 +119,7 @@ class Orchestrator:
                 return None
             try:
                 self._check_and_notify_backoffice(alfen)
-                return alfen.get_latest_tag(since=since, lookback_s=lookback_s, max_pages=100)
+                return alfen.get_latest_tag(since=since, lookback_s=lookback_s, max_pages=700)
             finally:
                 alfen.logout()
 
@@ -182,14 +182,25 @@ class Orchestrator:
             self._current_vehicle = None
 
     def _handle_evcc_online(self):
-        # On a clean shutdown EVCC publishes connected=false first, so _current_vehicle
-        # is already None. On a hard crash it doesn't, leaving a stale value that would
-        # trip the idempotency check in _apply_vehicle_for_uid and skip the EVCC call
-        # after restart. Clear it here unconditionally so the next connect event always
-        # re-applies the vehicle.
-        log.info("orchestrator: EVCC came online — next connect event will use extended lookback")
-        self._evcc_just_restarted = True
         self._current_vehicle = None
+
+        if self._car_connected:
+            # Car is already connected. On a clean EVCC shutdown it will have published
+            # connected=false first, resetting _car_connected. If it didn't (hard crash or
+            # fast restart), the retained connected=true MQTT message will be a no-op
+            # (same state → ignored by the listener). Don't wait for a second MQTT event
+            # that may never arrive — identify immediately.
+            log.info("orchestrator: EVCC came online with car connected — extended 72h log scan")
+            uid = self._identify_from_log(_STARTUP_LOOKBACK_S)
+            if not uid:
+                log.warning("orchestrator: extended log scan found no tag")
+                self._apply_unknown_tag()
+            else:
+                self._apply_vehicle_for_uid(uid)
+        else:
+            # Car not connected yet; set flag so the next plug-in uses extended lookback.
+            log.info("orchestrator: EVCC came online — next connect event will use extended lookback")
+            self._evcc_just_restarted = True
 
     def _handle_startup_check(self):
         """
