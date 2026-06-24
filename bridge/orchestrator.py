@@ -23,11 +23,12 @@ from typing import Optional
 from .alfen_client import AlfenClient, RateLimiter, uid_hash
 from .config import Config, normalise_uid
 from .evcc_client import EvccClient
-from .mqtt_listener import CONNECTED, DISCONNECTED, MqttListener
+from .mqtt_listener import CONNECTED, DISCONNECTED, EVCC_ONLINE, STARTUP_CHECK, MqttListener
 
 log = logging.getLogger(__name__)
 
 _SENTINEL = object()
+_STARTUP_LOOKBACK_S = 259200  # scan up to 72 h back when recovering a missed session
 
 
 class Orchestrator:
@@ -37,6 +38,8 @@ class Orchestrator:
         self._alfen_lock = threading.Lock()
         self._shutdown = threading.Event()
         self._current_vehicle: Optional[str] = None
+        self._car_connected: bool = False
+        self._evcc_just_restarted: bool = False
 
         self._rate_limiter = RateLimiter(config.login_rate_max, config.login_rate_window)
 
@@ -72,7 +75,54 @@ class Orchestrator:
             log_uid_plaintext=cfg.log_uid_plaintext,
         )
 
+    def _apply_vehicle_for_uid(self, uid: str):
+        """Map a UID to an EVCC vehicle name and set it, or apply unknown-tag behaviour."""
+        normalised = normalise_uid(uid)
+        uid_label = uid if self._cfg.log_uid_plaintext else uid_hash(normalised)
+        log.info("orchestrator: tag acquired uid_hash=%s", uid_label)
+
+        vehicle = self._cfg.uid_vehicle_map.get(normalised)
+        if not vehicle:
+            log.warning("orchestrator: UID %s not in map", uid_label)
+            self._apply_unknown_tag()
+            return
+
+        if self._current_vehicle == vehicle:
+            log.info("orchestrator: vehicle %s already selected, no action", vehicle)
+            return
+
+        if self._evcc.set_vehicle(vehicle):
+            self._current_vehicle = vehicle
+
+    def _identify_from_log(self, lookback_s: int) -> Optional[str]:
+        """Single-shot historical Alfen log scan — no deadline, up to 100 pages."""
+        since = datetime.now(tz=timezone.utc)
+        with self._alfen_lock:
+            alfen = self._make_alfen()
+            if not alfen.login():
+                log.warning("orchestrator: could not login to Alfen")
+                return None
+            try:
+                return alfen.get_latest_tag(since=since, lookback_s=lookback_s, max_pages=100)
+            finally:
+                alfen.logout()
+
     def _handle_connect(self, connect_time: datetime):
+        self._car_connected = True
+
+        # EVCC just restarted: the tap happened in the past — historical scan, no deadline
+        if self._evcc_just_restarted:
+            self._evcc_just_restarted = False
+            log.info("orchestrator: EVCC restart detected — extended 72h log scan")
+            uid = self._identify_from_log(_STARTUP_LOOKBACK_S)
+            if not uid:
+                log.warning("orchestrator: extended log scan found no tag")
+                self._apply_unknown_tag()
+            else:
+                self._apply_vehicle_for_uid(uid)
+            return
+
+        # Normal connect: poll with deadline — the tap may not be in the log yet
         uid: Optional[str] = None
 
         with self._alfen_lock:
@@ -103,30 +153,46 @@ class Orchestrator:
             self._apply_unknown_tag()
             return
 
-        normalised = normalise_uid(uid)
-        uid_label = uid if self._cfg.log_uid_plaintext else uid_hash(normalised)
-        log.info("orchestrator: tag acquired uid_hash=%s", uid_label)
-
-        vehicle = self._cfg.uid_vehicle_map.get(normalised)
-        if not vehicle:
-            log.warning("orchestrator: UID %s not in map — leaving EVCC on auto-detection", uid_label)
-            self._apply_unknown_tag()
-            return
-
-        # Idempotency: skip if already selected
-        if self._current_vehicle == vehicle:
-            log.info("orchestrator: vehicle %s already selected, no action", vehicle)
-            return
-
-        if self._evcc.set_vehicle(vehicle):
-            self._current_vehicle = vehicle
+        self._apply_vehicle_for_uid(uid)
 
     def _handle_disconnect(self):
+        self._car_connected = False
         if not self._cfg.release_on_disconnect:
             log.debug("orchestrator: release_on_disconnect=false, keeping selection")
             return
         if self._evcc.clear_vehicle():
             self._current_vehicle = None
+
+    def _handle_evcc_online(self):
+        # EVCC publishes connected=false before going offline, so _car_connected is
+        # already False by now. Set a flag so the imminent connected=true event uses
+        # the extended lookback instead of the 300s window.
+        log.info("orchestrator: EVCC came online — next connect event will use extended lookback")
+        self._evcc_just_restarted = True
+
+    def _handle_startup_check(self):
+        """
+        Called once on startup when a car is already connected.
+        If EVCC has a known vehicle assigned, trust it and record state.
+        If EVCC shows unknown/guest/empty, do a single extended 72h log scan
+        (no deadline — the tap happened in the past).
+        """
+        self._car_connected = True
+        current = self._evcc.get_vehicle()
+        known = set(self._cfg.uid_vehicle_map.values())
+
+        if current and current in known:
+            log.info("orchestrator: startup: car connected, vehicle=%s already set — no action", current)
+            self._current_vehicle = current
+            return
+
+        log.info("orchestrator: startup: car connected but vehicle=%r — identifying via Alfen (72h lookback)", current)
+        uid = self._identify_from_log(_STARTUP_LOOKBACK_S)
+        if not uid:
+            log.warning("orchestrator: startup: log scan found no tag")
+            self._apply_unknown_tag()
+            return
+        self._apply_vehicle_for_uid(uid)
 
     def _apply_unknown_tag(self):
         if self._cfg.on_unknown_tag == "default" and self._cfg.default_vehicle:
@@ -153,6 +219,10 @@ class Orchestrator:
                 self._handle_connect(ts)
             elif event == DISCONNECTED:
                 self._handle_disconnect()
+            elif event == EVCC_ONLINE:
+                self._handle_evcc_online()
+            elif event == STARTUP_CHECK:
+                self._handle_startup_check()
             else:
                 log.warning("orchestrator: unknown event %s", event)
 

@@ -1,105 +1,281 @@
 # evcc-alfen-uid-bridge
 
-Deterministic vehicle identification for EVCC when charging via an Alfen Single Pro-line.
+> Bridges EVCC and Alfen Single Pro-line chargers: reads RFID card UIDs from the Alfen local HTTPS API on vehicle connect events and automatically assigns the correct vehicle in EVCC via REST API, enabling deterministic vehicle identification without OCPP or ISO 15118.
 
-EVCC controls the charger over Modbus (EMS mode) and has no visibility of which RFID card started the session. This bridge reads the card UID from the Alfen's local HTTPS API and tells EVCC which vehicle to assign to the loadpoint.
+---
 
-## How it works
+## Table of Contents
+
+1. [Introduction](#introduction)
+2. [Background & Rationale](#background--rationale)
+3. [Architecture](#architecture)
+4. [Installation](#installation)
+5. [Configuration](#configuration)
+6. [Troubleshooting](#troubleshooting)
+
+---
+
+## Introduction
+
+**evcc-alfen-uid-bridge** is a lightweight containerised Python service that solves a specific integration gap: when [EVCC](https://evcc.io) controls an Alfen Single Pro-line charger in EMS (Modbus) mode, it has no way to read the RFID card that started a session. Without knowing which card was tapped, EVCC cannot reliably determine which vehicle is connected, making features like per-vehicle charge limits, SoC tracking, and smart charging plans unreliable.
+
+This bridge fills that gap by reading the card UID directly from the Alfen's local HTTPS management API and using it to set the correct vehicle in EVCC — automatically, on every plug-in.
+
+---
+
+## Background & Rationale
+
+### How EVCC controls the Alfen
+
+EVCC talks to the Alfen charger over **Modbus TCP** in EMS (Energy Management System) mode. In this mode EVCC acts as the energy manager: it reads measured currents and sets charge current limits. The charger handles all lower-level safety and OCPP communication independently.
+
+This is a clean and reliable control path, but it comes with a limitation: **Modbus EMS mode exposes no RFID data**. EVCC cannot see which card was tapped, because that information lives in the OCPP/application layer of the charger, not in the Modbus register map.
+
+### Why EVCC's built-in vehicle detection falls short
+
+EVCC has a built-in vehicle detection mechanism that polls each configured vehicle's cloud API (e.g. BMW CarData) to determine which car is at the charger, based on GPS location or charging status. In practice this is unreliable:
+
+- Cloud APIs have polling delays (30–60 s is common).
+- A vehicle reported as "charging" via its app may be at a different location (e.g. at a public charger).
+- Multiple vehicles from the same household will all show as "at home", making disambiguation impossible.
+- The BMW CarData API in particular is known to be flaky and slow to update.
+
+### The Alfen local API as a side-channel
+
+The Alfen Single Pro-line exposes a local HTTPS management API (the same one used by the MyEve app and ACE Service Installer). This API provides access to a structured device log that records every RFID tap event — **including the full card UID** — within seconds of it happening.
+
+By combining:
+- **EVCC's MQTT output** as a trigger (vehicle connected event)
+- **The Alfen local API** as a source of truth for the RFID UID
+- **EVCC's REST API** to assign the vehicle
+
+...it is possible to deterministically identify the vehicle within seconds of plug-in, without relying on cloud polling.
+
+### Why not OCPP?
+
+OCPP is the standard protocol for charger-to-backend communication and does carry RFID/transaction data. However:
+
+- EVCC's Alfen integration uses Modbus, not OCPP.
+- Routing OCPP through EVCC would require replacing or proxying the charger's existing OCPP backend, which is complex and potentially disrupts other integrations (e.g. smart charging tariffs, load balancing from the grid operator).
+
+The local API side-channel approach is non-intrusive and requires no changes to the charger's OCPP configuration.
+
+---
+
+## Architecture
 
 ```
-Car plugged in + RFID tap
-        │
-        ▼
-Alfen logs NFC tag in device log
-        │
-EVCC sees car connected → publishes MQTT connected=true
-        │
-        ▼
-Bridge reads Alfen log → extracts UID → maps to EVCC vehicle name
-        │
-        ▼
-Bridge calls EVCC REST API: POST /api/loadpoints/{id}/vehicle/{name}
+┌─────────────────────────────────────────────────────────┐
+│                      Host (Docker)                      │
+│                                                         │
+│  ┌──────────┐   Modbus TCP    ┌──────────────────────┐  │
+│  │   EVCC   │────────────────▶│  Alfen Single        │  │
+│  │          │                 │  Pro-line            │  │
+│  │          │◀────────────────│  10.0.40.66          │  │
+│  │  :7070   │   MQTT publish  └──────────────────────┘  │
+│  └────┬─────┘                          ▲                │
+│       │ evcc/loadpoints/1/connected    │ HTTPS :443     │
+│       │ evcc/status                    │ (local API)    │
+│       ▼                                │                │
+│  ┌─────────────────────────────────────┴──────────┐     │
+│  │           evcc-alfen-uid-bridge                │     │
+│  │                                                │     │
+│  │  1. MQTT: receive connected=true               │     │
+│  │  2. Alfen API: login, read log, find UID       │     │
+│  │  3. Map UID → EVCC vehicle name                │     │
+│  │  4. EVCC REST: POST /api/loadpoints/1/vehicle  │     │
+│  │                                                │     │
+│  │  Also: on evcc/status=online (EVCC restart)    │     │
+│  │  → re-apply last known vehicle without         │     │
+│  │    re-querying the Alfen                       │     │
+│  └────────────────────────────────────────────────┘     │
+│                                                         │
+│  ┌───────────┐                                          │
+│  │ Mosquitto │  :1883                                   │
+│  └───────────┘                                          │
+└─────────────────────────────────────────────────────────┘
 ```
 
-On disconnect, bridge calls `DELETE /api/loadpoints/{id}/vehicle` to revert to automatic detection.
+### Event flow
 
-## Important: single-session constraint
+**Normal plug-in:**
+1. Car is plugged in; driver taps RFID card on charger.
+2. Alfen logs the card UID in its device log.
+3. EVCC detects the car via Modbus and publishes `evcc/loadpoints/1/connected = true` to MQTT.
+4. Bridge receives the MQTT event and logs in to the Alfen local API.
+5. Bridge scans the device log, looking back up to 300 seconds (the tap always precedes the EVCC event).
+6. Bridge extracts the UID, normalises it, and looks it up in `UID_VEHICLE_MAP`.
+7. Bridge calls `POST /api/loadpoints/1/vehicle/{name}` on EVCC.
 
-The Alfen allows only **one** management API session at a time. The bridge holds the session only briefly per connect event. **Do not run the bridge alongside MyEve, ACE Service Installer, or the Home Assistant Alfen integration** — they share the same session slot. Between charging sessions the session is free.
+**Unplug:**
+1. EVCC publishes `connected = false`.
+2. Bridge calls `DELETE /api/loadpoints/1/vehicle` — EVCC returns to auto-detection.
 
-## Setup
+**EVCC restart while car is connected:**
+1. EVCC publishes `evcc/status = online`.
+2. Bridge detects this and re-applies the last known vehicle directly to EVCC — no Alfen login needed.
 
-### 1. Discover your card UIDs
+### Single-session constraint
 
-Run with plaintext UID logging enabled:
+The Alfen allows only **one** active management session at a time. The bridge holds the session only for the duration of each log read, then logs out. **Do not run the bridge alongside MyEve, ACE Service Installer, or any Home Assistant Alfen integration** — they compete for the same session slot. Between charging sessions the slot is free.
 
+---
+
+## Installation
+
+### Prerequisites
+
+- Docker and Docker Compose on the host running EVCC.
+- EVCC configured with `mqtt` publishing enabled (see [EVCC MQTT docs](https://docs.evcc.io/docs/reference/configuration/mqtt)).
+- The Alfen charger reachable on the network from the host (HTTPS port 443).
+- Alfen admin password.
+
+### 1. Clone the repository
+
+```bash
+git clone <your-repo-url> evcc-alfen-uid-bridge
+cd evcc-alfen-uid-bridge
 ```
+
+### 2. Create `.env`
+
+```bash
+cp .env.example .env
+$EDITOR .env
+```
+
+Fill in at minimum: `ALFEN_HOST`, `ALFEN_PASSWORD`, `EVCC_BASE_URL`, `MQTT_HOST`, and `UID_VEHICLE_MAP` (see [Configuration](#configuration) for how to discover UIDs).
+
+### 3. Discover your RFID card UIDs (first run)
+
+Run in discovery mode — this logs full UIDs and takes no action in EVCC:
+
+```bash
 LOG_LEVEL=DEBUG LOG_UID_PLAINTEXT=true DRY_RUN=true docker compose up
 ```
 
-Tap your RFID card at the charger and watch the logs. The bridge will log lines like:
+Tap your RFID card at the charger and watch the output. You will see lines like:
 
 ```
-alfen: tag candidate uid=041CF6BAC01690 lid=631424
+orchestrator: tag acquired uid_hash=... (plaintext: 041CF6BAC01690)
 ```
 
-Full UIDs appear in two log patterns:
-- `Reader 0 Got NFC tag: {UID}` — appears on first/online-auth tap
-- `Tag {UID} is authorised by server` — appears on whitelist updates
+Full UIDs come from two log patterns:
+- `Reader 0 Got NFC tag: {UID}` — fires on every tap (preferred source).
+- `Tag {UID} is authorised by server` — fires when the charger updates its whitelist.
 
-If only a short/truncated UID appears (e.g. `5B9F` instead of `5B9F4379`), check the OCPP transaction log in the charger's web UI (`https://10.0.40.66`) for the full UID, or look for a `Tag X is authorised` line from a previous session.
+> If only a short/truncated UID appears (e.g. `5B9F` instead of `5B9F4379`), look for a `Tag X is authorised` line from a previous session, or check the OCPP transaction log in the charger's web UI at `https://<alfen-ip>`.
 
-### 2. Configure the UID map
-
-In `.env`, set `UID_VEHICLE_MAP` to a JSON object mapping each card UID to the EVCC vehicle name:
+### 4. Update `.env` with the UID map
 
 ```
-UID_VEHICLE_MAP={"041CF6BAC01690": "bmw320e", "04F6E5D4C3B2": "q6"}
+UID_VEHICLE_MAP={"041CF6BAC01690": "bmwx130e", "5B9F4379": "bmw320e"}
 ```
 
-UIDs are matched case-insensitively with separators stripped (`04:A1:B2` = `04A1B2`).
+Vehicle names must match the `name:` field of the vehicle entries in your `evcc.yaml`.
 
-### 3. First run in dry-run mode
+### 5. (Optional) Add an "Unknown" vehicle to EVCC
+
+If you want unknown RFID cards (visitors, test cards) to charge under a named fallback vehicle instead of leaving EVCC in auto-detection mode, add this to your `evcc.yaml`:
+
+```yaml
+vehicles:
+  - name: unknown
+    type: template
+    template: offline
+    title: Unknown
+    capacity: 50     # set a sensible default capacity in kWh
+```
+
+Then in `.env`:
 
 ```
+ON_UNKNOWN_TAG=default
+DEFAULT_VEHICLE=unknown
+```
+
+> **When to use this:** Add the `unknown` vehicle if your charger is accessible to people other than the registered vehicle owners (family members, guests, visitors). Without it, an unrecognised card leaves EVCC in auto-detection mode, which may assign the wrong vehicle or none at all.
+>
+> **Note:** EVCC's built-in "Guest vehicle" (visible in the UI dropdown) cannot be set via the REST API and is therefore not usable as a bridge target. The `unknown` vehicle defined above is a separate, API-accessible entry.
+
+### 6. Run in dry-run mode to verify
+
+```bash
 DRY_RUN=true docker compose up
 ```
 
-Check that the bridge correctly identifies the card and logs the intended EVCC action without executing it.
+Plug in a car, tap the card, and confirm the logs show the correct vehicle being *selected* (without actually calling EVCC). Then stop the container and remove `DRY_RUN=true` (or set it to `false` in `.env`).
 
-### 4. Production run
+### 7. Start in production
 
-```
+```bash
 docker compose up -d
 ```
 
+---
+
 ## Configuration
 
-All settings via environment variables. See `.env.example` for the full list.
+All settings are via environment variables. The recommended approach is to keep them in `.env` (gitignored) and reference them from `docker-compose.yml`.
 
-| Key | Default | Description |
-|-----|---------|-------------|
-| `ALFEN_HOST` | — | Charger IP (e.g. `10.0.40.66`) |
-| `ALFEN_PASSWORD` | — | Admin password |
-| `EVCC_BASE_URL` | — | EVCC REST base URL |
-| `EVCC_LOADPOINT_ID` | — | Numeric loadpoint ID |
-| `MQTT_HOST` | — | MQTT broker host |
-| `UID_VEHICLE_MAP` | — | JSON: UID → EVCC vehicle name |
-| `TAG_WAIT_TIMEOUT_S` | `15` | Max seconds to wait for a tag after connect |
-| `RELEASE_ON_DISCONNECT` | `true` | Clear vehicle on disconnect |
-| `ON_UNKNOWN_TAG` | `auto` | `auto` = leave EVCC on auto-detection; `default` = set `DEFAULT_VEHICLE` |
-| `DRY_RUN` | `false` | Log actions without executing them |
-| `LOG_UID_PLAINTEXT` | `false` | Log full UIDs (personal data — discovery only) |
+| Variable | Default | Required | Description |
+|---|---|---|---|
+| `ALFEN_HOST` | — | ✓ | Charger IP address (e.g. `10.0.40.66`) |
+| `ALFEN_USERNAME` | `admin` | | Alfen management API username |
+| `ALFEN_PASSWORD` | — | ✓ | Alfen admin password |
+| `ALFEN_SOCKET` | `1` | | Socket number to match in state log lines |
+| `ALFEN_TLS_VERIFY` | `true` | | Set `false` to skip TLS cert verification (Alfen uses self-signed cert) |
+| `TAG_WAIT_TIMEOUT_S` | `15` | | Max seconds to poll for a tag after connect event |
+| `TAG_POLL_INTERVAL_S` | `3` | | Seconds between Alfen log polls during wait |
+| `LOGIN_RATE_MAX` | `5` | | Max Alfen logins allowed per rate window |
+| `LOGIN_RATE_WINDOW_S` | `60` | | Rate limit window in seconds |
+| `EVCC_BASE_URL` | — | ✓ | EVCC REST base URL (e.g. `http://127.0.0.1:7070`) |
+| `EVCC_LOADPOINT_ID` | `1` | | Numeric EVCC loadpoint ID |
+| `RELEASE_ON_DISCONNECT` | `true` | | Clear vehicle from EVCC on unplug |
+| `ON_UNKNOWN_TAG` | `auto` | | `auto` = leave on auto-detection; `default` = set `DEFAULT_VEHICLE` |
+| `DEFAULT_VEHICLE` | — | | Vehicle name to assign for unknown cards (requires `ON_UNKNOWN_TAG=default`) |
+| `MQTT_HOST` | — | ✓ | MQTT broker hostname or IP |
+| `MQTT_PORT` | `1883` | | MQTT broker port |
+| `MQTT_USERNAME` | — | | MQTT username |
+| `MQTT_PASSWORD` | — | | MQTT password |
+| `MQTT_TOPIC_PREFIX` | `evcc` | | EVCC MQTT topic prefix (must match `evcc.yaml`) |
+| `UID_VEHICLE_MAP` | — | ✓ | JSON object mapping normalised UID → EVCC vehicle name |
+| `LOG_LEVEL` | `INFO` | | Python log level (`DEBUG`, `INFO`, `WARNING`) |
+| `LOG_UID_PLAINTEXT` | `false` | | Log full UIDs instead of hashes (personal data — discovery only) |
+| `DRY_RUN` | `false` | | Log intended actions without executing them |
+
+### UID normalisation
+
+UIDs are normalised before matching: non-alphanumeric characters are stripped and the string is uppercased. This means `04:A1:B2:C3` and `04a1b2c3` both match `04A1B2C3` in the map.
+
+### BMW CarData vehicles
+
+When configuring BMW vehicles in EVCC, the `clientid` is a **registered OAuth application ID**, not a per-account or per-vehicle identifier. It is the same for all vehicles in the same BMW ConnectedDrive account. If two vehicles belong to different BMW accounts, use the same community `clientid` for both — the VIN determines which car's data is returned. Each account must be separately authorised through the EVCC UI.
+
+---
 
 ## Troubleshooting
 
-**Bridge logs `401` from Alfen**: Connection reuse failed. Another client (MyEve, HA integration) is holding the session. Stop the other client and restart the bridge.
+**`401` errors from Alfen / bridge logs "login failed"**
+Another client is holding the management session. MyEve, ACE Service Installer, and some Home Assistant integrations all compete for the same single session slot. Stop the other client and restart the bridge. The Alfen also rate-limits logins to ~5 per 60 seconds — repeated restarts can trigger this temporarily.
 
-**Bridge logs `no RFID tag found within Xs window`**: The card UID doesn't appear in the patterns the bridge searches. Run with `LOG_UID_PLAINTEXT=true` at DEBUG to see raw log lines. Check whether your firmware logs a different pattern.
+**"no RFID tag found within Xs window"**
+The bridge polled the Alfen log but found no matching UID. Run with `LOG_LEVEL=DEBUG LOG_UID_PLAINTEXT=true` to see raw candidates. Possible causes:
+- The card tap did not produce an NFC reader line in the log (uncommon).
+- The charger was in offline/auth mode and only logged a truncated UID — check for a `Tag X is authorised` line from a recent session.
+- The connect event fired more than 300 seconds after the tap (e.g. the car was plugged in without a card, then a card was tapped later).
 
-**EVCC still shows wrong vehicle after a tap**: Check `DRY_RUN=false` and that the UID in `UID_VEHICLE_MAP` matches exactly (check normalisation: strip colons, uppercase).
+**Vehicle set to wrong car**
+Check `UID_VEHICLE_MAP` in `.env` — UIDs are normalised (uppercase, no separators). Run with `LOG_UID_PLAINTEXT=true` to confirm which UID is being detected. The two patterns (NFC reader vs. OCPP auth line) can produce different representations of the same card; the bridge prefers the NFC reader line.
 
-**Rate limit warning**: Another process is triggering rapid logins. The bridge self-limits to 5 logins/60s.
+**EVCC restarts and vehicle selection is lost**
+The bridge subscribes to `evcc/status` and re-applies the last known vehicle automatically when EVCC comes back online, as long as the car is still connected. No manual intervention needed.
+
+**EVCC still shows "requesting authorization" for a BMW vehicle**
+The OAuth callback URL (`http://<evcc-host>:<port>/...`) must be reachable from the browser you use to authorise. If you authorise from a remote device via VPN or Tailscale, the BMW redirect may land on the wrong host. Use a browser on the local network that can reach EVCC directly.
+
+**`docker compose restart` does not pick up `.env` changes**
+Use `docker compose up -d --force-recreate` instead. `restart` reuses the existing container environment.
 
 ## Running tests
 
@@ -110,7 +286,9 @@ pytest tests/
 
 ## Network requirements
 
-The container needs reachability to:
-- `10.0.40.66:443` — Alfen HTTPS API (IoT VLAN)
-- `127.0.0.1:7070` — EVCC REST API
-- `127.0.0.1:1883` — MQTT broker
+The container uses `network_mode: host` — it shares the host network stack, so `127.0.0.1` reaches both EVCC and the MQTT broker directly.
+
+Outbound access required:
+- `<ALFEN_HOST>:443` — Alfen local HTTPS API
+- `<EVCC_HOST>:<PORT>` — EVCC REST API
+- `<MQTT_HOST>:1883` — MQTT broker

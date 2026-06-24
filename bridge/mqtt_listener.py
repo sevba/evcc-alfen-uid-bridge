@@ -1,6 +1,9 @@
 import logging
+import os
 import time
 from typing import Callable
+
+_HEALTH_FILE = "/tmp/bridge.healthy"
 
 import paho.mqtt.client as mqtt
 
@@ -9,6 +12,8 @@ log = logging.getLogger(__name__)
 # Events dispatched to the orchestrator
 CONNECTED = "connected"
 DISCONNECTED = "disconnected"
+EVCC_ONLINE = "evcc_online"
+STARTUP_CHECK = "startup_check"
 
 
 class MqttListener:
@@ -16,8 +21,11 @@ class MqttListener:
     Subscribes to EVCC loadpoint MQTT topics and dispatches connect/disconnect
     events to the provided callback.
 
-    Callback signature: cb(event: str, topic: str, payload: str)
-    where event is CONNECTED or DISCONNECTED.
+    Also subscribes to evcc/status — when EVCC (re)starts and publishes 'online',
+    fires EVCC_ONLINE so the orchestrator can re-apply the vehicle assignment.
+
+    Callback signature: cb(event: str) where event is CONNECTED, DISCONNECTED,
+    or EVCC_ONLINE.
     """
 
     def __init__(self, host: str, port: int, username: str, password: str,
@@ -32,11 +40,10 @@ class MqttListener:
         self._on_event = on_event
 
         self._connected_topic = f"{topic_prefix}/loadpoints/{loadpoint_id}/connected"
+        self._status_topic = f"{topic_prefix}/status"
 
-        # Track last seen state to detect transitions (ignore retained stale state
-        # on first reconnect until we see an actual transition)
         self._last_connected: bool | None = None
-        self._first_message = True
+        self._initial_retained_seen = False  # absorb the first retained message
 
         self._client = mqtt.Client(client_id="evcc-uid-bridge", clean_session=True)
         if username:
@@ -50,12 +57,21 @@ class MqttListener:
         if rc == 0:
             log.info("mqtt: connected to %s:%d", self._host, self._port)
             client.subscribe(self._connected_topic)
-            log.debug("mqtt: subscribed to %s", self._connected_topic)
-            self._first_message = True  # reset on reconnect — ignore retained state
+            client.subscribe(self._status_topic)
+            log.debug("mqtt: subscribed to %s, %s", self._connected_topic, self._status_topic)
+            self._initial_retained_seen = False  # reset on reconnect
+            try:
+                open(_HEALTH_FILE, "w").close()
+            except OSError:
+                pass
         else:
             log.error("mqtt: connect failed rc=%d", rc)
 
     def _on_disconnect(self, client, userdata, rc):
+        try:
+            os.remove(_HEALTH_FILE)
+        except OSError:
+            pass
         if rc != 0:
             log.warning("mqtt: unexpected disconnect rc=%d — will auto-reconnect", rc)
 
@@ -64,18 +80,29 @@ class MqttListener:
         topic = msg.topic
         log.debug("mqtt: %s = %s (retained=%s)", topic, payload, msg.retain)
 
+        if topic == self._status_topic:
+            if payload.lower() == "online" and not msg.retain:
+                log.info("mqtt: EVCC came online")
+                self._fire(EVCC_ONLINE)
+            return
+
         if topic != self._connected_topic:
             return
 
         now_connected = payload.lower() == "true"
 
-        # On the very first message after (re)connect, record state without firing
-        # an event — we only want to act on genuine transitions, not stale retained
-        # messages that reflect pre-restart state.
-        if self._first_message:
-            self._first_message = False
+        # On (re)connect, absorb the retained message — don't fire CONNECTED/DISCONNECTED
+        # since the RFID tap is likely outside the normal 300s window. Instead fire
+        # STARTUP_CHECK when connected=true so the orchestrator can check EVCC state
+        # and re-identify if needed using an extended lookback window.
+        if not self._initial_retained_seen:
+            self._initial_retained_seen = True
             self._last_connected = now_connected
-            log.debug("mqtt: initial state connected=%s (no event fired)", now_connected)
+            if now_connected:
+                log.info("mqtt: startup: car is connected — triggering startup check")
+                self._fire(STARTUP_CHECK)
+            else:
+                log.debug("mqtt: startup: no car connected")
             return
 
         if now_connected == self._last_connected:
@@ -84,6 +111,9 @@ class MqttListener:
         self._last_connected = now_connected
         event = CONNECTED if now_connected else DISCONNECTED
         log.info("mqtt: loadpoint %d → %s", self._lp, event)
+        self._fire(event)
+
+    def _fire(self, event: str):
         try:
             self._on_event(event)
         except Exception as exc:

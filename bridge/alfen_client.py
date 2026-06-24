@@ -62,7 +62,7 @@ def _parse_log_line(raw: str) -> Optional[Tuple[int, datetime, str]]:
         return None
 
 
-def _extract_tag_entry(message: str, socket: int) -> Optional[str]:
+def _extract_tag_entry(message: str, socket: int, full_uid_only: bool = False) -> Optional[str]:
     """Return the RFID UID from a log message, or None.
 
     Three patterns, in preference order:
@@ -73,10 +73,10 @@ def _extract_tag_entry(message: str, socket: int) -> Optional[str]:
     3. State line — has socket, but UID may be TRUNCATED by firmware (taskMain.c):
          Socket #1: main state: ..., tag: 5B9F
 
-    Patterns 1 and 2 are accepted for any socket (they are NFC reader events, not
-    per-socket events, and the charger is single-socket). Pattern 3 is filtered
-    by socket number and should only be used as a fallback since short UIDs won't
-    match the full UID stored in the vehicle map.
+    Patterns 1 and 2 are accepted for any socket. Pattern 3 is a fallback for
+    normal (short-window) connects. For extended-lookback scans (full_uid_only=True)
+    pattern 3 is skipped — state lines from earlier sessions would produce stale or
+    truncated UIDs that override the correct NFC reader entry.
     """
     # Pattern 1: NFC reader — full UID, always accept
     m = _RE_NFC_READER.search(message)
@@ -88,14 +88,15 @@ def _extract_tag_entry(message: str, socket: int) -> Optional[str]:
     if m:
         return m.group(1)
 
-    # Pattern 3: State line — check socket, warn about potential truncation
-    m_sock = _RE_SOCKET.search(message)
-    if m_sock and int(m_sock.group(1)) == socket:
-        m_tag = _RE_STATE_TAG.search(message)
-        if m_tag:
-            uid = m_tag.group(1)
-            log.debug("alfen: tag from state-line (may be truncated): %s", uid)
-            return uid
+    # Pattern 3: State line — skip for extended lookback scans
+    if not full_uid_only:
+        m_sock = _RE_SOCKET.search(message)
+        if m_sock and int(m_sock.group(1)) == socket:
+            m_tag = _RE_STATE_TAG.search(message)
+            if m_tag:
+                uid = m_tag.group(1)
+                log.debug("alfen: tag from state-line (may be truncated): %s", uid)
+                return uid
 
     return None
 
@@ -219,27 +220,31 @@ class AlfenClient:
             log.error("alfen: log fetch error: %s", exc)
             return None
 
-    def get_latest_tag(self, since: datetime) -> Optional[str]:
+    def get_latest_tag(self, since: datetime, lookback_s: int = _LOOKBACK_S,
+                       max_pages: int = 20) -> Optional[str]:
         """
         Scan the device log for the most recent RFID tag on our socket
         within the session window.
 
         The RFID tap is logged BEFORE EVCC fires the connected=true event,
-        so we look back _LOOKBACK_S seconds before `since` as well as forward.
-        We continue forward polling until the caller's wait window expires.
+        so we look back `lookback_s` seconds before `since`. Pass a large
+        lookback_s (e.g. 259200) on startup to recover sessions from hours ago.
+
+        max_pages caps how many 128-entry pages are fetched. Raise it for
+        extended-lookback scans where the tap may be deep in the log history.
 
         Returns the UID string with the highest log-ID found, or None.
         """
         since_aware = since.replace(tzinfo=timezone.utc) if since.tzinfo is None else since
         from datetime import timedelta
-        window_start = since_aware - timedelta(seconds=_LOOKBACK_S)
+        window_start = since_aware - timedelta(seconds=lookback_s)
 
         best_lid = -1
         best_uid: Optional[str] = None
         offset = 0
         pages_searched = 0
 
-        while pages_searched < 20:  # safety cap
+        while pages_searched < max_pages:
             raw = self._get_log_page(offset)
             if raw is None:
                 return None
@@ -265,7 +270,8 @@ class AlfenClient:
                     hit_before_window = True
                     break  # entries are too old — stop paginating
 
-                uid = _extract_tag_entry(message, self._socket)
+                uid = _extract_tag_entry(message, self._socket,
+                                         full_uid_only=(lookback_s > _LOOKBACK_S))
                 if uid and lid > best_lid:
                     best_lid = lid
                     best_uid = uid

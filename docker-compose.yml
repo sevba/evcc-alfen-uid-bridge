@@ -21,8 +21,9 @@ services:
       EVCC_LOADPOINT_ID: "1"
 
       # Behaviour
-      RELEASE_ON_DISCONNECT: "true"
-      ON_UNKNOWN_TAG: "auto"
+      RELEASE_ON_DISCONNECT: "${RELEASE_ON_DISCONNECT:-true}"
+      ON_UNKNOWN_TAG: "${ON_UNKNOWN_TAG:-auto}"
+      DEFAULT_VEHICLE: "${DEFAULT_VEHICLE:-}"
 
       # MQTT
       MQTT_HOST: "127.0.0.1"
