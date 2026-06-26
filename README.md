@@ -11,7 +11,8 @@
 3. [Architecture](#architecture)
 4. [Installation](#installation)
 5. [Configuration](#configuration)
-6. [Troubleshooting](#troubleshooting)
+6. [Notifications](#notifications)
+7. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -243,6 +244,8 @@ All settings are via environment variables. The recommended approach is to keep 
 | `MQTT_PASSWORD` | — | | MQTT password |
 | `MQTT_TOPIC_PREFIX` | `evcc` | | EVCC MQTT topic prefix (must match `evcc.yaml`) |
 | `UID_VEHICLE_MAP` | — | ✓ | JSON object mapping normalised UID → EVCC vehicle name |
+| `BACKOFFICE_CHECK_ENABLED` | `true` | | Check the charger's OCPP back-office connection at session start and notify if offline. Set `false` to disable the check and its notification entirely (see [Notifications](#notifications)) |
+| `NOTIFY_URL` | *(HA webhook)* | | HTTP endpoint the offline alert is POSTed to as JSON `{"title","msg"}` |
 | `LOG_LEVEL` | `INFO` | | Python log level (`DEBUG`, `INFO`, `WARNING`) |
 | `LOG_UID_PLAINTEXT` | `false` | | Log full UIDs instead of hashes (personal data — discovery only) |
 | `DRY_RUN` | `false` | | Log intended actions without executing them |
@@ -262,6 +265,85 @@ This means `UID_VEHICLE_MAP` only ever needs full UIDs — there is no need to a
 ### BMW CarData vehicles
 
 When configuring BMW vehicles in EVCC, the `clientid` is a **registered OAuth application ID**, not a per-account or per-vehicle identifier. It is the same for all vehicles in the same BMW ConnectedDrive account. If two vehicles belong to different BMW accounts, use the same community `clientid` for both — the VIN determines which car's data is returned. Each account must be separately authorised through the EVCC UI.
+
+---
+
+## Notifications
+
+The bridge can send a single, advisory push notification: an **Alfen back-office offline alert**. At the start of each charging session it reads the charger's `BOConnection` status from the Alfen local API; if that is not `"online"` (the charger has lost contact with its OCPP back office), it fires one notification. The check is fire-and-forget on a daemon thread and never blocks or affects RFID/vehicle detection.
+
+### Enable / disable
+
+Controlled by a single flag, `BACKOFFICE_CHECK_ENABLED` (default `true`). Setting it to `false` disables the check *and* its notification — there are no other notifications in the bridge.
+
+```dotenv
+BACKOFFICE_CHECK_ENABLED=false
+```
+
+`docker compose restart` does **not** re-read `.env`; recreate the container to apply:
+
+```bash
+docker compose up -d --force-recreate
+```
+
+Verify with `docker logs <container> 2>&1 | grep backoffice_check`.
+
+### Notification target (`NOTIFY_URL`)
+
+The alert is a fire-and-forget HTTP `POST` to `NOTIFY_URL` with a JSON body:
+
+```json
+{ "title": "EV charger", "msg": "Alfen back office OFFLINE - ... (seen at session start HH:MM:SS DD/MM/YYYY)." }
+```
+
+Point `NOTIFY_URL` at anything that accepts this shape. The default is a **Home Assistant webhook** that relays the message to a mobile-app push notification (setup below). Any service that can parse a JSON `{title, msg}` POST works too.
+
+### Home Assistant setup (webhook → mobile-app push)
+
+This delivers the alert to the HA companion app without any extra notification service.
+
+1. **Add a webhook automation.** In `automations.yaml` (or via the UI: *Settings → Automations → Create → from YAML*). Replace `<your_device>` with your companion-app device — list options in *Developer Tools → Actions* by searching `notify.mobile_app_`:
+
+   ```yaml
+   - id: evcc_notify_push
+     alias: 'EVCC: push notification via mobile app'
+     mode: queued
+     max: 10
+     trigger:
+       - platform: webhook
+         webhook_id: evcc-push-CHANGE-ME    # pick your own unguessable string
+         local_only: true                   # only reachable from the local network
+         allowed_methods: [POST]
+     action:
+       - service: notify.mobile_app_<your_device>
+         data:
+           title: '{{ trigger.json.title }}'
+           message: '{{ trigger.json.msg }}'
+   ```
+
+   To notify several devices, point the action at a [notify group](https://www.home-assistant.io/integrations/group/#notify-groups) instead.
+
+2. **Reload automations** (or restart HA) so the webhook registers.
+
+3. **Set `NOTIFY_URL`** in `.env` to match your `webhook_id`. From a container on the HA host (`network_mode: host`), `127.0.0.1:8123` reaches HA:
+
+   ```dotenv
+   NOTIFY_URL=http://127.0.0.1:8123/api/webhook/evcc-push-CHANGE-ME
+   ```
+
+   Recreate the container (`docker compose up -d --force-recreate`).
+
+4. **Test the path** independently of the bridge:
+
+   ```bash
+   curl -X POST http://127.0.0.1:8123/api/webhook/evcc-push-CHANGE-ME \
+     -H 'Content-Type: application/json' \
+     -d '{"title":"EV charger","msg":"test"}'
+   ```
+
+   A `200` plus a push on your phone confirms the HA side. Webhooks need no auth token — keep the `webhook_id` secret and `local_only: true` so it is only reachable on your LAN.
+
+> The same webhook/automation can be shared by EVCC's own messaging (`messaging.services: [{type: custom, ...}]` POSTing the same `{title, msg}` JSON), so charge-session and back-office alerts land through one HA automation.
 
 ---
 

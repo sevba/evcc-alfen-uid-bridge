@@ -259,13 +259,7 @@ class Orchestrator:
             try:
                 resp = requests.post(
                     url,
-                    data=msg.encode("utf-8"),
-                    headers={
-                        "Content-Type": "text/plain; charset=utf-8",
-                        "X-Title": "EV charger",
-                        "X-Priority": "3",
-                        "X-Tags": "electric_plug",
-                    },
+                    json={"title": "EV charger", "msg": msg},
                     timeout=5,
                 )
                 log.info("orchestrator: back-office offline notification sent (HTTP %s)", resp.status_code)

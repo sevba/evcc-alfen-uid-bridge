@@ -35,6 +35,9 @@ services:
       # UID → vehicle map  (add cards here; UIDs are normalised before matching)
       UID_VEHICLE_MAP: '${UID_VEHICLE_MAP}'
 
+      # Notifications → Home Assistant webhook (forwarded to mobile_app push)
+      NOTIFY_URL: "${NOTIFY_URL:-http://127.0.0.1:8123/api/webhook/evcc-push-CHANGE-ME}"
+
       # Logging
       LOG_LEVEL: "INFO"
       LOG_UID_PLAINTEXT: "false"

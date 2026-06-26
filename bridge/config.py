@@ -77,7 +77,7 @@ class Config:
         c.log_uid_plaintext = _bool(_env("LOG_UID_PLAINTEXT", "false"))
 
         c.backoffice_check_enabled = _bool(_env("BACKOFFICE_CHECK_ENABLED", "true"))
-        c.notify_url = _env("NOTIFY_URL", "http://127.0.0.1:2586/evcc")
+        c.notify_url = _env("NOTIFY_URL", "http://127.0.0.1:8123/api/webhook/evcc-push-CHANGE-ME")
 
         return c
 
